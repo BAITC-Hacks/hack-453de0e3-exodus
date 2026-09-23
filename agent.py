@@ -6,10 +6,6 @@ import pandas as pd
 
 
 class Agent:
-    # User-selected planning objective, not a claimed or hardcoded score.
-    TARGET_EXPECTED_NET = 3_000_000.0
-    TARGET_TOLERANCE = 0.05
-
     def act(self, env):
         profile = env.customer_profile
         tariffs = set(env.tariffs["tariff_plan_code"])
@@ -63,7 +59,7 @@ class Agent:
                 continue
             picked.append((cur, seg, target, channel))
             tested.add((cur, seg))
-            if len(picked) >= 12:
+            if len(picked) >= 16:
                 break
 
         observations = defaultdict(lambda: [0.0, 0])
@@ -108,27 +104,6 @@ class Agent:
             size = estimates[key]["size"]
             pilot(key, 160 if size >= 500 else 100)
 
-        # Re-test up to four valuable, uncertain transitions. The choice is
-        # recomputed after every observation and never rests on one small pilot.
-        repeated = set()
-        for _ in range(4):
-            choices = []
-            for key in picked:
-                transition = key[:3]
-                if transition in repeated or transition not in observations:
-                    continue
-                item = estimates[key]
-                n_seen = observations[transition][1]
-                current_value = item["ratio"] * item["arpu_sum"] - item["cost"] * item["size"]
-                uncertainty = 0.804 / np.sqrt(max(n_seen, 1))
-                value_of_information = max(current_value, 0) * uncertainty
-                choices.append((value_of_information, key))
-            if not choices:
-                break
-            key = max(choices)[1]
-            repeated.add(key[:3])
-            pilot(key, 200)
-
         # Compatible tariff cells can form one broad campaign. Cells are kept
         # disjoint across campaigns, and each bundle stays below 5,000 contacts.
         # Pilot identities are not exposed by the public interface. Estimate
@@ -159,40 +134,44 @@ class Agent:
             if chosen:
                 candidates.append((seg, target, channel, chosen))
 
-        campaigns, used = [], set()
-        budget, contacts = float(env.remaining_budget), int(env.remaining_contacts)
-        while len(campaigns) < 10 and contacts > 0:
-            remaining_gain = self.TARGET_EXPECTED_NET - expected_net
-            if campaigns and remaining_gain <= self.TARGET_EXPECTED_NET * self.TARGET_TOLERANCE:
-                break
-            best, best_gain = None, 0.0
-            for seg, target, channel, members in candidates:
-                cost = float(channels[channel]["cost_per_contact"])
-                available = [entry for entry in members if (entry[0], seg) not in used]
-                available.sort(key=lambda entry: entry[1] / entry[2], reverse=True)
-                selected, count, gain = [], 0, 0.0
-                for cur, value, size in available:
-                    improves_target = abs(remaining_gain - gain - value) < abs(remaining_gain - gain)
-                    if (improves_target and count + size <= min(5000, contacts)
-                            and (count + size) * cost <= budget):
-                        selected.append(cur)
-                        count += size
-                        gain += value
-                improvement = abs(remaining_gain) - abs(remaining_gain - gain)
-                if selected and improvement > best_gain:
-                    best, best_gain = (seg, target, channel, selected, count, cost, gain), improvement
-            if best is None:
-                break
-            seg, target, channel, selected, count, cost, gain = best
-            campaigns.append({"campaign_name": f"plan_{len(campaigns) + 1}_{seg}_{channel}",
-                              "filter_arpu_segment": seg,
-                              "filter_current_tariff": ";".join(selected),
-                              "target_tariff": target, "channel": channel})
-            used.update((cur, seg) for cur in selected)
-            contacts -= count
-            budget -= count * cost
-            expected_net += gain
-        self.planning_summary = {"target_expected_net": self.TARGET_EXPECTED_NET,
-                                 "estimated_net": expected_net,
+        def make_plan(money_shadow, contact_shadow):
+            # Shadow prices represent opportunities lost by spending a scarce
+            # budget unit or contact on the current campaign.
+            campaigns, used = [], set()
+            budget, contacts = float(env.remaining_budget), int(env.remaining_contacts)
+            predicted_gain = 0.0
+            while len(campaigns) < 10 and contacts > 0:
+                best, best_score = None, 0.0
+                for seg, target, channel, members in candidates:
+                    cost = float(channels[channel]["cost_per_contact"])
+                    available = [entry for entry in members if (entry[0], seg) not in used]
+                    available.sort(key=lambda entry: entry[1] / entry[2], reverse=True)
+                    selected, count, gain = [], 0, 0.0
+                    for cur, value, size in available:
+                        if (count + size <= min(5000, contacts)
+                                and (count + size) * cost <= budget):
+                            selected.append(cur)
+                            count += size
+                            gain += value
+                    score = gain - money_shadow * count * cost - contact_shadow * count
+                    if selected and score > best_score:
+                        best = (seg, target, channel, selected, count, cost, gain)
+                        best_score = score
+                if best is None:
+                    break
+                seg, target, channel, selected, count, cost, gain = best
+                campaigns.append({"campaign_name": f"plan_{len(campaigns) + 1}_{seg}_{channel}",
+                                  "filter_arpu_segment": seg,
+                                  "filter_current_tariff": ";".join(selected),
+                                  "target_tariff": target, "channel": channel})
+                used.update((cur, seg) for cur in selected)
+                contacts -= count
+                budget -= count * cost
+                predicted_gain += gain
+            return predicted_gain, campaigns
+
+        added_gain, campaigns = make_plan(0.0, 0.0)
+        expected_net += added_gain
+        self.planning_summary = {"estimated_net": expected_net,
                                  "final_campaigns": len(campaigns)}
         return campaigns
